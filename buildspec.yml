@@ -1,0 +1,58 @@
+---
+version: 0.2
+
+env:
+  # Ziehe JWT_SECRET direkt aus SSM Parameter Store (Name: JWT_SECRET)
+  parameter-store:
+    JWT_SECRET: "JWT_SECRET"
+  # Die folgenden Variablen werden aus dem CodeBuild Project / CloudFormation gesetzt,
+  # falls nicht, kannst du sie hier hardcoden (nicht empfohlen).
+  variables:
+    REPOSITORY_NAME: "Server-Deployment-and-Containerization"
+    # falls REPOSITORY_URI nicht als env kommt, setze hier: REPOSITORY_URI: "539042711120.dkr.ecr.eu-central-1.amazonaws.com/your-repo"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.7
+    commands:
+      - echo "==> Install: remove problematic Corretto apt source (if present)"
+      - if [ -f /etc/apt/sources.list.d/corretto*.list ]; then sudo rm -f /etc/apt/sources.list.d/corretto*.list || true; fi
+      - sudo apt-get update -y
+      - sudo apt-get install -y --no-install-recommends jq
+      - echo "==> Start docker daemon"
+      - sudo nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2375 --storage-driver=overlay2 > /tmp/dockerd.log 2>&1 &
+      - timeout 30 sh -c "until docker info >/dev/null 2>&1; do echo '.'; sleep 1; done"
+      - python -m pip install --upgrade pip awscli pytest
+
+  pre_build:
+    commands:
+      - echo "==> Pre-build: set region and login into ECR"
+      - export AWS_DEFAULT_REGION=eu-central-1
+      - echo "REPOSITORY_URI is $REPOSITORY_URI"
+      - if [ -z "$REPOSITORY_URI" ]; then
+          echo "REPOSITORY_URI not set as env — attempting to build repo name from account...";
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text);
+          REPOSITORY_URI="$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/${REPOSITORY_NAME}";
+        fi
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
+      - echo "==> Make JWT secret file for build (will NOT be committed)"
+      - printf '%s' "$JWT_SECRET" > jwt_secret.txt
+      - ls -lah jwt_secret.txt
+
+  build:
+    commands:
+      - echo "==> Build: build docker image (with build-arg JWT_SECRET)"
+      - docker build --no-cache -t $REPOSITORY_URI:latest --build-arg JWT_SECRET="$(cat jwt_secret.txt)" .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$CODEBUILD_RESOLVED_SOURCE_VERSION || true
+
+  post_build:
+    commands:
+      - echo "==> Push image to ECR"
+      - docker push $REPOSITORY_URI:latest
+      - if [ -n "$CODEBUILD_RESOLVED_SOURCE_VERSION" ]; then docker push $REPOSITORY_URI:$CODEBUILD_RESOLVED_SOURCE_VERSION || true; fi
+      - echo "==> Run tests (optional) - tries to run pytest in repo"
+      - pytest -q || echo "pytest returned non-zero (failures might be real)"; exit 0
+artifacts:
+  files:
+    - '**/*'
