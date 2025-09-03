@@ -1,0 +1,183 @@
+# my-flask-cluster — Deployment & CI/CD README
+
+**Project**: my-flask-cluster / my-cicd-stack
+
+This README contains instructions for reviewers to verify the Flask API deployed to EKS, how the CI/CD pipeline is configured, and cleanup steps. It also contains troubleshooting tips and useful commands (PowerShell + curl).
+
+---
+
+## Quick summary
+
+* **EKS cluster**: `my-flask-cluster`
+* **Kubernetes manifests applied**: `k8s-flask-deploy.yaml` (Deployment + Service)
+* **Kubernetes Secret (JWT)**: `jwt-secret` in namespace `default` (contains `JWT_SECRET`)
+* **CodePipeline / CodeBuild stack**: `my-cicd-stack`
+* **ECR image** (optional reference): `539042711120.dkr.ecr.eu-central-1.amazonaws.com/my-cicd-stack-ecrdockerrepository-knsdojsnhxvu:latest`
+
+---
+
+## External URL (LoadBalancer)
+
+The application is exposed via a Kubernetes Service of type `LoadBalancer`. Use the following URL to access the API:
+
+```
+http://a8f076f6c85c0410db7504899f5f5e7b-667772542.eu-central-1.elb.amazonaws.com
+```
+
+> If your environment differs, run `kubectl get svc flask-service` to get the current hostname.
+
+---
+
+## Endpoints to verify
+
+1. **Health** (GET `/`)
+
+   * Expected: `"Healthy"`
+2. **Auth** (POST `/auth`)
+
+   * Input JSON: `{ "email": "test@example.com", "password": "pw" }`
+   * Expected: JSON response containing a `token` field (JWT)
+3. **Contents** (GET `/contents`)
+
+   * Requires header: `Authorization: Bearer <token>`
+   * Expected: JSON with `email`, `exp`, `nbf` fields
+
+---
+
+## Example verification commands
+
+### PowerShell (Windows)
+
+```powershell
+# 1) Health
+Invoke-RestMethod -Uri "http://a8f076f6c85c0410db7504899f5f5e7b-667772542.eu-central-1.elb.amazonaws.com/" -UseBasicParsing
+# Expected output: Healthy
+
+# 2) Create token
+$body = @{ email = "test@example.com"; password = "pw" } | ConvertTo-Json
+$response = Invoke-RestMethod -Method Post -Uri "http://a8f076f6c85c0410db7504899f5f5e7b-667772542.eu-central-1.elb.amazonaws.com/auth" -ContentType "application/json" -Body $body
+$token = $response.token
+Write-Output $token
+
+# 3) Use token to read contents
+Invoke-RestMethod -Method Get -Uri "http://a8f076f6c85c0410db7504899f5f5e7b-667772542.eu-central-1.elb.amazonaws.com/contents" -Headers @{ Authorization = "Bearer $token" } -UseBasicParsing
+```
+
+### curl (Linux / macOS)
+
+```bash
+# 1) Health
+curl -i http://a8f076f6c85c0410db7504899f5f5e7b-667772542.eu-central-1.elb.amazonaws.com/
+
+# 2) Create token
+curl -s -X POST "http://a8f076f6c85c0410db7504899f5f5e7b-667772542.eu-central-1.elb.amazonaws.com/auth" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"pw"}'
+
+# 3) Use token to read contents
+curl -s -H "Authorization: Bearer <JWT_TOKEN>" \
+  http://a8f076f6c85c0410db7504899f5f5e7b-667772542.eu-central-1.elb.amazonaws.com/contents
+```
+
+---
+
+## What the reviewer should check (Acceptance checklist)
+
+* `GET /` returns `Healthy`.
+* `POST /auth` returns a JSON with `token` field.
+* `GET /contents` with valid Bearer token returns `email`, `exp`, `nbf`.
+* The Service `flask-service` is type `LoadBalancer` and the ELB hostname is reachable.
+* `JWT_SECRET` is not stored in the repo — it is stored as a Kubernetes Secret called `jwt-secret`.
+
+---
+
+## Kubernetes commands (debug / introspection)
+
+```bash
+# Show deployment & pods
+kubectl get deployments
+kubectl get pods -l app=flask -o wide
+
+# Describe deployment
+kubectl describe deployment flask-deployment
+
+# View logs for all flask pods
+kubectl logs -l app=flask -f
+
+# Get the ELB/hostname
+kubectl get svc flask-service -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
+
+# Check secret exists and inspect (value is base64 encoded)
+kubectl get secret jwt-secret -o yaml
+
+# Exec into a pod and check env (if needed)
+POD=$(kubectl get pods -l app=flask -o jsonpath="{.items[0].metadata.name}")
+kubectl exec -it $POD -- printenv JWT_SECRET
+```
+
+> Note: `kubectl exec` will print the secret value if it was exposed into the pod environment. This is expected for verification but the secret itself must not be committed to source control.
+
+---
+
+## CI/CD notes
+
+* CloudFormation stack: `my-cicd-stack`.
+* Pipeline source: GitHub repo `MustNet/Server-Deployment-and-Containerization` (branch `master`).
+* CodeBuild project: `my-cicd-stack` (created by the CFN template).
+* The pipeline's Source stage uses GitHub; Build stage runs CodeBuild which builds the Docker image, pushes to ECR and deploys to the EKS cluster.
+* The build is configured to read `JWT_SECRET` from Parameter Store / Secrets Manager (depending on template parameters). Locally for K8s we used a Kubernetes Secret instead.
+
+---
+
+## Running locally (Docker)
+
+To build and run the Docker image locally (example used during development):
+
+```bash
+# Build (example uses build-arg or environment variable)
+docker build --build-arg JWT_SECRET="udacity050820!" -t my-flask-app:local .
+
+# Run (expose port 8080 and pass secret via env)
+docker run --rm -p 8080:8080 --name my-flask-local -e JWT_SECRET="udacity050820!" my-flask-app:local
+
+# Verify locally
+curl -i http://localhost:8080/
+```
+
+> Note: For production you should not pass secrets via build args or unencrypted ENV. Use SSM/Secrets Manager or Kubernetes Secrets.
+
+---
+
+## Cleanup
+
+If you want to remove the deployed resources from the cluster:
+
+```bash
+kubectl delete -f k8s-flask-deploy.yaml
+kubectl delete secret jwt-secret
+```
+
+If you want to remove the entire EKS cluster and associated resources (costly):
+
+```bash
+eksctl delete cluster --region=eu-central-1 --name=my-flask-cluster
+```
+
+---
+
+## Troubleshooting / Known issues
+
+* **ELB pending**: When creating a `LoadBalancer` the external hostname can take 1–2 minutes to appear. Re-run `kubectl get svc`.
+* **Pods CrashLoop / Not ready**: `kubectl logs <pod>` and `kubectl describe pod <pod>` are the first steps. Ensure the `JWT_SECRET` is available in the pod environment via secret mapping.
+* **CI Build fails on apt-get / package errors**: The CodeBuild environment runs commands that may fail if remote apt repos are temporarily unavailable. Re-run the pipeline; check CloudWatch Logs for exact failure messages.
+* **CodeBuild decrypt variable error**: Ensure that the SSM Parameter or Secrets Manager secret name used in the buildspec exists and the CodeBuild service role has `ssm:GetParameters` or `secretsmanager:GetSecretValue` permissions.
+
+---
+
+## Contact / Notes for reviewer
+
+If you need me to run the verification live using the ELB URL above, say so — I can test endpoints and paste outputs. If you need modifications to the buildspec (e.g., to ensure `JWT_SECRET` is read from SSM) or to add tests to the build, I can update the template and the `buildspec.yml` accordingly.
+
+---
+
+*Generated for the Udacity Server Deployment & Containerization project — provides verification steps and reviewer instructions.*
