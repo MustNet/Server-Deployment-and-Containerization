@@ -62,6 +62,10 @@ Parameters:
     MaxLength: 100
     ConstraintDescription: You must enter a kubectl IAM role
 
+  GitHubTokenSecretArn:
+    Type: String
+    Description: "ARN of Secrets Manager secret that contains GitHub PAT"
+
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -353,7 +357,7 @@ Resources:
                 Owner: !Ref GitHubUser
                 Repo: !Ref GitSourceRepo
                 Branch: !Ref GitBranch
-                OAuthToken: !Ref GitHubToken
+                OAuthToken: !Sub '{{resolve:secretsmanager:${GitHubTokenSecretArn}:SecretString}}'
               OutputArtifacts:
                 - Name: App
               RunOrder: 1
